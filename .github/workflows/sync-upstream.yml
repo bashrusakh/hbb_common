@@ -1,19 +1,112 @@
-name: sync upstream
+# .github/workflows/sync-upstream.yml — for bashrusakh/hbb_common
+#
+# Keeps `main` of bashrusakh/hbb_common in sync with the default branch (`main`)
+# of upstream rustdesk/hbb_common. Design constraints (full rationale: REPORT.md):
+#   * merge / fast-forward only — never rebase, never force-push; every existing
+#     pinned SHA (387603f, 229b9045, 36ab6ed, bb416bc) stays valid
+#   * introduces NO content of its own: it merges upstream refs and nothing else;
+#     on merge conflict it aborts loudly and pushes nothing — conflicts are
+#     resolved by humans only (MANUAL-FALLBACK.md section C)
+#   * 36ab6ed ("chore: declare AGPL-3.0 license") stays on `main` — merges keep it
+#   * least privilege: `contents: write` only; no PAT, no repo secrets, and the
+#     GITHUB_TOKEN is never echoed
+#   * stock GitHub only: actions/checkout (GitHub first-party) + git + GITHUB_TOKEN
+#
+# PLATFORM NOTE (verified in GitHub docs, "Disabling and enabling a workflow"):
+# "When a public repository is forked, scheduled workflows are disabled by
+# default." After installing this file you must run, once:
+#     gh workflow enable sync-upstream.yml --repo bashrusakh/hbb_common
+# and confirm a `schedule`-triggered run appears (INSTALL.md steps 2-5).
+
+name: Sync upstream
 
 on:
   schedule:
-    - cron: "23 3 * * 1"
+    # 04:17 UTC daily. The minute is off the top of the hour on purpose: GitHub
+    # documents that scheduled runs can be delayed (or dropped) under load and
+    # that "high load times include the start of every hour".
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Sync main with upstream
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: gh repo sync "$REPO" -b main
+      - name: Checkout main (full history)
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          # persist-credentials defaults to true: the push below authenticates
+          # with the in-repo GITHUB_TOKEN (contents: write). No other secrets.
+          persist-credentials: true
+
+      - name: Set merge identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream main
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/rustdesk/hbb_common.git
+          git fetch --no-tags upstream +main:refs/remotes/upstream/main
+          {
+            echo "### Sync state"
+            echo ""
+            echo "- fork \`main\`:     \`$(git rev-parse HEAD)\` — $(git log -1 --format=%s HEAD)"
+            echo "- upstream \`main\`: \`$(git rev-parse refs/remotes/upstream/main)\` — $(git log -1 --format=%s refs/remotes/upstream/main)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Merge upstream/main into main (no-op when already in sync)
+        id: merge
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor refs/remotes/upstream/main HEAD; then
+            echo "Already in sync: every commit of upstream/main is already on main. Nothing to do."
+            echo "changed=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          UPSTREAM_SHA="$(git rev-parse refs/remotes/upstream/main)"
+          if ! git merge -m "Merge upstream rustdesk/hbb_common main (${UPSTREAM_SHA}) into main" refs/remotes/upstream/main; then
+            {
+              echo "::error title=Upstream sync FAILED::Merge of upstream/main into main CONFLICTED. Nothing was pushed. Human resolution required (MANUAL-FALLBACK.md section C)."
+              echo ""
+              echo "### CONFLICT — nothing was pushed"
+              echo ""
+              echo "Unmerged paths:"
+              git diff --name-only --diff-filter=U | sed 's/^/  - /'
+              echo ""
+              echo "Resolve by hand (MANUAL-FALLBACK.md section C). Never rebase, never"
+              echo "force-push, never drop 36ab6ed (AGPL-3.0 license metadata)."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "changed=yes" >> "$GITHUB_OUTPUT"
+
+      - name: Push main (fast-forward only, never forced)
+        if: steps.merge.outputs.changed == 'yes'
+        run: |
+          set -euo pipefail
+          if ! git push origin HEAD:main; then
+            echo "::error title=Upstream sync FAILED::Push rejected (main moved concurrently?). Nothing was force-pushed. Re-run this workflow."
+            exit 1
+          fi
+          {
+            echo "### Merged and pushed"
+            echo ""
+            echo "- merge commit: \`$(git rev-parse HEAD)\`"
+            echo "- now contains upstream main \`$(git rev-parse refs/remotes/upstream/main)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Note (already in sync)
+        if: steps.merge.outputs.changed == 'no'
+        run: echo "Already in sync with upstream/main — no-op run (nothing pushed)." >> "$GITHUB_STEP_SUMMARY"
